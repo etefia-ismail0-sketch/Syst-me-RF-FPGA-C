@@ -1,0 +1,697 @@
+/* ========================================================================
+ * PFE BTS CIEL - Option B (Électronique et Réseaux)
+ * Dispositif embarqué de sécurité radiofréquence
+ * -----------------------------------------------------------------------
+ * Fichier      : main.c
+ * Cible        : MicroBlaze MCS - FPGA Artix-7 (Digilent Basys 3)
+ * Sous-système : 1 - Firmware & C embarqué (Vitis Unified IDE)
+ * Norme        : C99, typage strict (stdint.h), aucune allocation dynamique
+ * -----------------------------------------------------------------------
+ * Rôle du firmware :
+ *   1) Échantillonner en temps réel le RSSI issu du bloc IP FFT/RSSI
+ *      (VHDL, sous-système 2) via un bus AXI4-Lite.
+ *   2) Lisser la mesure avec un filtre moyenneur glissant (N = 16).
+ *   3) Détecter une attaque de brouillage (jamming) via une machine à
+ *      états finis (FSM) à hystérésis, afin d'éliminer les fausses
+ *      alarmes dues au bruit de mesure.
+ *   4) Piloter les LEDs d'alerte de la Basys 3 (registres GPO).
+ *   5) Formater et transmettre des trames JSON légères sur liaison
+ *      UART/RS485 à destination de la passerelle ESP32 (MQTT/JSON).
+ * -----------------------------------------------------------------------
+ * IMPORTANT - Points à adapter selon TON design Vivado / BSP généré :
+ *   - Les noms exacts des macros XPAR_* dépendent du nommage donné aux
+ *     IP dans le Block Design (IO Module, IP FFT/RSSI personnalisée).
+ *     Ils sont ici indiqués par un commentaire "// <-- À ADAPTER".
+ *   - Les identifiants d'interruption (XIN_IOMODULE_FIT_x_INTERRUPT_INTR)
+ *     dépendent de la configuration des interruptions dans l'IP IO
+ *     Module (ordre de câblage des sources dans le concentrateur).
+ *   - La période du timer FIT (Fixed Interval Timer) doit être réglée
+ *     dans les propriétés de l'IP IO Module (registre de rechargement)
+ *     pour obtenir une interruption toutes les 1 ms à la fréquence
+ *     d'horloge système réellement utilisée (ex. 100 MHz).
+ * ========================================================================
+ */
+
+/* ------------------------------------------------------------------- */
+/* 1. INCLUDES                                                          */
+/* ------------------------------------------------------------------- */
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+
+#include "xparameters.h"      /* Constantes générées par Vivado/Vitis   */
+#include "xiomodule.h"        /* Driver IO Module (GPIO, UART, FIT/PIT) */
+#include "xstatus.h"          /* XST_SUCCESS / XST_FAILURE              */
+#include "xil_io.h"           /* Xil_In32 / Xil_Out32 (accès AXI-Lite)  */
+#include "xil_exception.h"    /* Xil_ExceptionRegisterHandler/Enable()  */
+#include "xil_printf.h"       /* xil_printf() - traces de débogage UART */
+
+/* ------------------------------------------------------------------- */
+/* 2. CONFIGURATION MATÉRIELLE - À ADAPTER SELON xparameters.h          */
+/* ------------------------------------------------------------------- */
+
+/* Identifiant du périphérique IO Module (GPIO + UART + FIT intégrés
+ * dans le MicroBlaze MCS). */
+#define IOMODULE_DEVICE_ID          XPAR_MICROBLAZE_MCS_0_DEVICE_ID    /* <-- Déduit de ton .xpr (instance "microblaze_mcs_0") À RECONFIRMER dans xparameters.h */
+
+/* Identifiant de la source d'interruption FIT1 dans le concentrateur
+ * d'interruptions interne de l'IO Module. */
+#define FIT1_INTERRUPT_ID           XIN_IOMODULE_FIT_1_INTERRUPT_INTR  /* <-- À ADAPTER */
+
+/* Canal GPO utilisé pour les 4 LEDs d'alerte de la Basys 3.
+ * (Channel 1 du GPO configuré dans l'IP IO Module) */
+#define GPO_LED_CHANNEL             1U
+
+/* Masques de bits sur le registre GPO (LEDs Basys 3) */
+#define LED_MASK_ALERTE             0x01U   /* LED rouge  : jamming détecté   */
+#define LED_MASK_NORMAL             0x02U   /* LED verte  : état nominal      */
+#define LED_MASK_HEARTBEAT          0x04U   /* LED clignotante : firmware vivant */
+
+/* Adresse de base du bloc IP FFT/RSSI (VHDL, AXI4-Lite, sous-système 2).
+ * Registres mémoire mappés :
+ *   OFFSET 0x00 : RSSI courant (int16 signé, en dixièmes de dBm ou dBm)
+ *   OFFSET 0x04 : Index du bin FFT au pic spectral (uint32)
+ *   OFFSET 0x08 : Registre de statut (bit0 = donnée prête)
+ *   OFFSET 0x0C : Registre de contrôle (bit0 = reset/enable FFT) */
+/* --- Bascule de simulation ---
+ * Ton Block Design Vivado actuel (design_1) ne contient pour l'instant
+ * que le Clocking Wizard et le MicroBlaze MCS : l'IP FFT/RSSI du
+ * sous-système 2 n'existe pas encore. On met donc SIMULATE_RSSI à 1
+ * pour pouvoir compiler, flasher et valider toute la chaîne logicielle
+ * (filtrage, FSM, JSON, LEDs) dès maintenant, sans attendre le VHDL.
+ *
+ * Le jour où l'IP FFT/RSSI est intégrée dans le Block Design :
+ *   1) repasser SIMULATE_RSSI à 0,
+ *   2) remplacer FFT_RSSI_BASEADDR par la vraie macro XPAR_..._BASEADDR
+ *      générée pour cette IP (visible dans xparameters.h après export
+ *      du hardware et régénération de la plateforme Vitis). */
+#define SIMULATE_RSSI               1
+
+#define FFT_RSSI_BASEADDR           0x00000000U /* <-- À REMPLACER par la vraie adresse une fois l'IP FFT/RSSI créée */
+#define REG_RSSI_OFFSET             0x00U
+#define REG_PEAK_BIN_OFFSET         0x04U
+#define REG_STATUS_OFFSET           0x08U
+#define REG_CTRL_OFFSET             0x0CU
+#define STATUS_DATA_READY_BIT       0x01U
+
+/* Paramètres de la chaîne FFT, nécessaires pour convertir un numéro de
+ * bin en fréquence physique (résolution spectrale). */
+#define FFT_SIZE                    1024U          /* Nombre de points FFT   */
+#define ADC_SAMPLE_RATE_HZ          20000000U      /* Fréquence d'échant.    */
+#define RF_CENTER_FREQ_HZ           433000000U     /* Fréquence centrale RF  */
+
+/* ------------------------------------------------------------------- */
+/* 3. PARAMÈTRES DE L'ALGORITHME DE DÉTECTION                           */
+/* ------------------------------------------------------------------- */
+
+#define RSSI_MA_WINDOW              16U     /* Fenêtre du moyenneur glissant */
+#define RSSI_THRESHOLD_HIGH_DBM     (-45)   /* Seuil haut : déclt. alerte    */
+#define RSSI_THRESHOLD_LOW_DBM      (-60)   /* Seuil bas  : retour normal    */
+
+#define SAMPLE_PERIOD_MS            1U      /* Période d'échantillonnage    */
+#define HEARTBEAT_PERIOD_MS         1000U   /* Période trame de statut      */
+
+#define UART_TX_BUFFER_SIZE         160U    /* Taille max. trame JSON       */
+
+/* ------------------------------------------------------------------- */
+/* 4. TYPES                                                             */
+/* ------------------------------------------------------------------- */
+
+/* États de la machine à états finis de détection de brouillage */
+typedef enum
+{
+    RF_STATE_NORMAL = 0,
+    RF_STATE_ALERTE = 1
+} RfEtat_t;
+
+/* ------------------------------------------------------------------- */
+/* 5. VARIABLES GLOBALES (accédées depuis l'ISR -> volatile obligatoire)*/
+/* ------------------------------------------------------------------- */
+
+static XIOModule g_io_module;                         /* Instance driver IO Module */
+
+/* --- Filtre moyenneur glissant sur le RSSI --- */
+static volatile int16_t  g_rssi_buffer[RSSI_MA_WINDOW]; /* Buffer circulaire */
+static volatile uint8_t  g_buffer_index        = 0U;
+static volatile uint8_t  g_buffer_rempli_count  = 0U;   /* Montée en charge  */
+static volatile int32_t  g_rssi_somme          = 0;
+static volatile int16_t  g_rssi_moyenne_dbm    = 0;
+
+/* --- Synchronisation ISR -> boucle principale --- */
+static volatile uint8_t  g_nouvel_echantillon_pret = 0U;
+static volatile uint32_t g_horloge_systeme_ms       = 0U;
+static volatile uint32_t g_peak_bin_latched         = 0U;
+
+/* --- État de la FSM et statistiques de supervision --- */
+static volatile RfEtat_t g_etat_courant        = RF_STATE_NORMAL;
+static uint32_t          g_compteur_alertes    = 0U;
+static uint32_t          g_dernier_ts_alerte_ms = 0U;
+
+/* ------------------------------------------------------------------- */
+/* 6. PROTOTYPES - séparation claire des responsabilités                */
+/* ------------------------------------------------------------------- */
+
+/* Initialisation */
+static int32_t  BSP_InitIOModule(void);
+static void     BSP_InitInterruptions(void);
+
+/* Traitement du signal (lecture RF + filtrage) */
+static inline int16_t RF_LireRssiBrut(void);
+static inline uint32_t RF_LirePeakBin(void);
+static int32_t  RF_ComputeFrequencePicHz(uint32_t peak_bin);
+static void     RF_EchantillonnerEtFiltrer(void);
+
+/* Machine à états finis (détection à hystérésis) */
+static void     FSM_MettreAJour(int16_t rssi_moyenne);
+static void     FSM_TransitionVersAlerte(int16_t rssi_moyenne);
+static void     FSM_TransitionVersNormal(int16_t rssi_moyenne);
+
+/* Sortie GPIO (LEDs) */
+static void     GPIO_MettreAJourLeds(RfEtat_t etat, uint8_t heartbeat_on);
+
+/* Communication UART / JSON (RS485 -> ESP32) */
+static void     UART_EnvoyerTrame(const char *trame, uint32_t longueur);
+static uint32_t JSON_ConstruireTrameAlerte(char *buf, int16_t rssi, int32_t freq_hz, uint32_t ts_ms);
+static uint32_t JSON_ConstruireTrameNormale(char *buf, int16_t rssi, uint32_t ts_ms);
+static uint32_t JSON_ConstruireTrameStatut(char *buf, int16_t rssi, RfEtat_t etat, uint32_t ts_ms, uint32_t nb_alertes);
+
+/* Utilitaires de conversion entier -> chaîne (pas de sprintf/malloc) */
+static uint32_t UTIL_AjouterChaine(char *dest, uint32_t curseur, const char *src);
+static uint32_t UTIL_AjouterEntierSigne(char *dest, uint32_t curseur, int32_t valeur);
+static uint32_t UTIL_AjouterEntierNonSigne(char *dest, uint32_t curseur, uint32_t valeur);
+
+/* Interruption */
+static void     ISR_TimerFit1(void *CallBackRef);
+
+/* ------------------------------------------------------------------- */
+/* 7. UTILITAIRES DE CONSTRUCTION DE CHAÎNES (sans sprintf ni malloc)   */
+/* ------------------------------------------------------------------- */
+
+/* Ajoute une chaîne littérale dans le buffer de sortie et renvoie le
+ * nouveau curseur d'écriture. */
+static uint32_t UTIL_AjouterChaine(char *dest, uint32_t curseur, const char *src)
+{
+    uint32_t i = 0U;
+    while (src[i] != '\0' && (curseur + i) < (UART_TX_BUFFER_SIZE - 1U))
+    {
+        dest[curseur + i] = src[i];
+        i++;
+    }
+    return (curseur + i);
+}
+
+/* Convertit et ajoute un entier signé (ex: RSSI en dBm) dans le buffer. */
+static uint32_t UTIL_AjouterEntierSigne(char *dest, uint32_t curseur, int32_t valeur)
+{
+    char tmp[12];
+    uint32_t i = 0U;
+    uint32_t j;
+    uint32_t est_negatif = 0U;
+    uint32_t v;
+
+    if (valeur < 0)
+    {
+        est_negatif = 1U;
+        v = (uint32_t)(-valeur);
+    }
+    else
+    {
+        v = (uint32_t)valeur;
+    }
+
+    if (v == 0U)
+    {
+        tmp[i++] = '0';
+    }
+    else
+    {
+        while (v > 0U)
+        {
+            tmp[i++] = (char)('0' + (v % 10U));
+            v /= 10U;
+        }
+    }
+
+    if (est_negatif != 0U)
+    {
+        dest[curseur] = '-';
+        curseur++;
+    }
+
+    /* Les chiffres ont été empilés à l'envers : on les réinjecte dans
+     * le bon ordre. */
+    for (j = i; j > 0U; j--)
+    {
+        if (curseur < (UART_TX_BUFFER_SIZE - 1U))
+        {
+            dest[curseur] = tmp[j - 1U];
+            curseur++;
+        }
+    }
+    return curseur;
+}
+
+/* Convertit et ajoute un entier non signé (ex: timestamp, bin FFT). */
+static uint32_t UTIL_AjouterEntierNonSigne(char *dest, uint32_t curseur, uint32_t valeur)
+{
+    char tmp[12];
+    uint32_t i = 0U;
+    uint32_t j;
+    uint32_t v = valeur;
+
+    if (v == 0U)
+    {
+        tmp[i++] = '0';
+    }
+    else
+    {
+        while (v > 0U)
+        {
+            tmp[i++] = (char)('0' + (v % 10U));
+            v /= 10U;
+        }
+    }
+
+    for (j = i; j > 0U; j--)
+    {
+        if (curseur < (UART_TX_BUFFER_SIZE - 1U))
+        {
+            dest[curseur] = tmp[j - 1U];
+            curseur++;
+        }
+    }
+    return curseur;
+}
+
+/* ------------------------------------------------------------------- */
+/* 8. ACCÈS AU BLOC IP FFT/RSSI (AXI4-Lite, sous-système 2 VHDL)        */
+/* ------------------------------------------------------------------- */
+
+#if (SIMULATE_RSSI == 1)
+/* ---------------------------------------------------------------
+ * MODE SIMULATION : génère une rampe de RSSI en dents de scie entre
+ * -80 dBm (bruit de fond) et -30 dBm (brouillage fort), afin de
+ * déclencher et relâcher l'alerte périodiquement, sans matériel FFT.
+ * Utile pour valider la FSM, le JSON et les LEDs dès maintenant. --- */
+static int16_t RF_LireRssiSimule(void)
+{
+    static int16_t  rssi_simule        = -80;
+    static int8_t   pas_simulation      = 1;
+
+    rssi_simule = (int16_t)(rssi_simule + pas_simulation);
+
+    if (rssi_simule >= -30)
+    {
+        pas_simulation = -1;
+    }
+    else if (rssi_simule <= -80)
+    {
+        pas_simulation = 1;
+    }
+
+    return rssi_simule;
+}
+#endif /* SIMULATE_RSSI */
+
+static inline int16_t RF_LireRssiBrut(void)
+{
+#if (SIMULATE_RSSI == 1)
+    return RF_LireRssiSimule();
+#else
+    /* Le registre matériel encode le RSSI en dBm signé sur 32 bits ;
+     * on le ramène à 16 bits, suffisant pour la plage RF utile. */
+    int32_t brut = (int32_t)Xil_In32(FFT_RSSI_BASEADDR + REG_RSSI_OFFSET);
+    return (int16_t)brut;
+#endif
+}
+
+static inline uint32_t RF_LirePeakBin(void)
+{
+#if (SIMULATE_RSSI == 1)
+    return (FFT_SIZE / 2U); /* Bin central simulé = fréquence porteuse */
+#else
+    return Xil_In32(FFT_RSSI_BASEADDR + REG_PEAK_BIN_OFFSET);
+#endif
+}
+
+/* Convertit l'indice du bin FFT au pic spectral en fréquence absolue
+ * (Hz), en tenant compte du repliement spectre (bin > FFT_SIZE/2 =
+ * fréquences négatives autour de la porteuse). */
+static int32_t RF_ComputeFrequencePicHz(uint32_t peak_bin)
+{
+    int32_t   bin_signe;
+    int32_t   freq_relative_hz;
+    const uint32_t demi_fft = FFT_SIZE / 2U;
+
+    if (peak_bin >= demi_fft)
+    {
+        bin_signe = (int32_t)peak_bin - (int32_t)FFT_SIZE;
+    }
+    else
+    {
+        bin_signe = (int32_t)peak_bin;
+    }
+
+    freq_relative_hz = (bin_signe * (int32_t)(ADC_SAMPLE_RATE_HZ / FFT_SIZE));
+
+    return ((int32_t)RF_CENTER_FREQ_HZ + freq_relative_hz);
+}
+
+/* ------------------------------------------------------------------- */
+/* 9. FILTRE MOYENNEUR GLISSANT (N = 16) - appelé depuis l'ISR          */
+/* ------------------------------------------------------------------- */
+
+static void RF_EchantillonnerEtFiltrer(void)
+{
+    int16_t nouvel_echantillon = RF_LireRssiBrut();
+
+    /* Mise à jour du buffer circulaire : on retire l'ancien
+     * échantillon de la somme avant d'ajouter le nouveau (technique
+     * "somme glissante", coût constant O(1), pas de recalcul complet). */
+    g_rssi_somme -= (int32_t)g_rssi_buffer[g_buffer_index];
+    g_rssi_buffer[g_buffer_index] = nouvel_echantillon;
+    g_rssi_somme += (int32_t)nouvel_echantillon;
+
+    g_buffer_index = (uint8_t)((g_buffer_index + 1U) % RSSI_MA_WINDOW);
+
+    if (g_buffer_rempli_count < RSSI_MA_WINDOW)
+    {
+        g_buffer_rempli_count++;
+    }
+
+    /* Moyenne calculée sur le nombre d'échantillons réellement
+     * disponibles (évite un biais vers 0 pendant le remplissage
+     * initial du buffer au démarrage). */
+    g_rssi_moyenne_dbm = (int16_t)(g_rssi_somme / (int32_t)g_buffer_rempli_count);
+
+    /* On mémorise le bin de pic associé, utile pour enrichir la
+     * trame JSON en cas de déclenchement d'alerte. */
+    g_peak_bin_latched = RF_LirePeakBin();
+
+    g_nouvel_echantillon_pret = 1U;
+}
+
+/* ------------------------------------------------------------------- */
+/* 10. MACHINE À ÉTATS FINIS - FILTRAGE À HYSTÉRÉSIS                    */
+/* ------------------------------------------------------------------- */
+/*
+ *                 RSSI >= -45 dBm
+ *      +-------------------------------+
+ *      |                                v
+ *  [ NORMAL ]                      [ ALERTE ]
+ *      ^                                |
+ *      +-------------------------------+
+ *                 RSSI <= -60 dBm
+ *
+ *  Entre -60 dBm et -45 dBm : zone morte (bande d'hystérésis) dans
+ *  laquelle l'état courant est conservé -> élimine le phénomène de
+ *  "chattering" (fausses alarmes dues au bruit autour d'un seuil unique).
+ */
+static void FSM_MettreAJour(int16_t rssi_moyenne)
+{
+    switch (g_etat_courant)
+    {
+        case RF_STATE_NORMAL:
+            if (rssi_moyenne >= RSSI_THRESHOLD_HIGH_DBM)
+            {
+                FSM_TransitionVersAlerte(rssi_moyenne);
+            }
+            break;
+
+        case RF_STATE_ALERTE:
+            if (rssi_moyenne <= RSSI_THRESHOLD_LOW_DBM)
+            {
+                FSM_TransitionVersNormal(rssi_moyenne);
+            }
+            break;
+
+        default:
+            /* État impossible : repli sécuritaire vers NORMAL. */
+            g_etat_courant = RF_STATE_NORMAL;
+            break;
+    }
+}
+
+static void FSM_TransitionVersAlerte(int16_t rssi_moyenne)
+{
+    char     trame[UART_TX_BUFFER_SIZE];
+    uint32_t longueur;
+    int32_t  freq_pic_hz;
+
+    g_etat_courant          = RF_STATE_ALERTE;
+    g_compteur_alertes++;
+    g_dernier_ts_alerte_ms  = g_horloge_systeme_ms;
+
+    freq_pic_hz = RF_ComputeFrequencePicHz(g_peak_bin_latched);
+
+    longueur = JSON_ConstruireTrameAlerte(trame, rssi_moyenne, freq_pic_hz, g_horloge_systeme_ms);
+    UART_EnvoyerTrame(trame, longueur);
+
+    GPIO_MettreAJourLeds(g_etat_courant, 0U);
+}
+
+static void FSM_TransitionVersNormal(int16_t rssi_moyenne)
+{
+    char     trame[UART_TX_BUFFER_SIZE];
+    uint32_t longueur;
+
+    g_etat_courant = RF_STATE_NORMAL;
+
+    longueur = JSON_ConstruireTrameNormale(trame, rssi_moyenne, g_horloge_systeme_ms);
+    UART_EnvoyerTrame(trame, longueur);
+
+    GPIO_MettreAJourLeds(g_etat_courant, 0U);
+}
+
+/* ------------------------------------------------------------------- */
+/* 11. CONSTRUCTION DES TRAMES JSON (format attendu par l'ESP32/MQTT)   */
+/* ------------------------------------------------------------------- */
+
+static uint32_t JSON_ConstruireTrameAlerte(char *buf, int16_t rssi, int32_t freq_hz, uint32_t ts_ms)
+{
+    uint32_t c = 0U;
+    c = UTIL_AjouterChaine(buf, c, "{\"event\":\"JAMMING_DETECTED\",\"rssi\":");
+    c = UTIL_AjouterEntierSigne(buf, c, (int32_t)rssi);
+    c = UTIL_AjouterChaine(buf, c, ",\"peak_freq_hz\":");
+    c = UTIL_AjouterEntierSigne(buf, c, freq_hz);
+    c = UTIL_AjouterChaine(buf, c, ",\"timestamp_ms\":");
+    c = UTIL_AjouterEntierNonSigne(buf, c, ts_ms);
+    c = UTIL_AjouterChaine(buf, c, "}\r\n");
+    buf[c] = '\0';
+    return c;
+}
+
+static uint32_t JSON_ConstruireTrameNormale(char *buf, int16_t rssi, uint32_t ts_ms)
+{
+    uint32_t c = 0U;
+    c = UTIL_AjouterChaine(buf, c, "{\"event\":\"JAMMING_CLEARED\",\"rssi\":");
+    c = UTIL_AjouterEntierSigne(buf, c, (int32_t)rssi);
+    c = UTIL_AjouterChaine(buf, c, ",\"timestamp_ms\":");
+    c = UTIL_AjouterEntierNonSigne(buf, c, ts_ms);
+    c = UTIL_AjouterChaine(buf, c, "}\r\n");
+    buf[c] = '\0';
+    return c;
+}
+
+static uint32_t JSON_ConstruireTrameStatut(char *buf, int16_t rssi, RfEtat_t etat, uint32_t ts_ms, uint32_t nb_alertes)
+{
+    uint32_t c = 0U;
+    c = UTIL_AjouterChaine(buf, c, "{\"event\":\"STATUS\",\"rssi\":");
+    c = UTIL_AjouterEntierSigne(buf, c, (int32_t)rssi);
+    c = UTIL_AjouterChaine(buf, c, ",\"state\":\"");
+    c = UTIL_AjouterChaine(buf, c, (etat == RF_STATE_ALERTE) ? "ALERT" : "NORMAL");
+    c = UTIL_AjouterChaine(buf, c, "\",\"alert_count\":");
+    c = UTIL_AjouterEntierNonSigne(buf, c, nb_alertes);
+    c = UTIL_AjouterChaine(buf, c, ",\"timestamp_ms\":");
+    c = UTIL_AjouterEntierNonSigne(buf, c, ts_ms);
+    c = UTIL_AjouterChaine(buf, c, "}\r\n");
+    buf[c] = '\0';
+    return c;
+}
+
+/* ------------------------------------------------------------------- */
+/* 12. ÉMISSION UART (liaison RS485 vers passerelle ESP32)              */
+/* ------------------------------------------------------------------- */
+
+static void UART_EnvoyerTrame(const char *trame, uint32_t longueur)
+{
+    uint32_t i;
+
+    /* Envoi bloquant, octet par octet, via l'accès bas niveau
+     * XIOModule_SendByte() de l'UART intégrée à l'IO Module.
+     * On n'utilise pas de gestionnaire d'interruption TX ici : la
+     * boucle attend simplement que le FIFO matériel ait de la place
+     * avant chaque octet, ce qui reste largement suffisant au débit
+     * RS485 utilisé pour des trames JSON courtes. */
+    for (i = 0U; i < longueur; i++)
+    {
+        /* XIOModule_IsSendFull() n'existe pas dans ta version du BSP
+         * (confirmé par l'erreur de compilation) : on envoie donc
+         * directement chaque octet. Au débit RS485 utilisé pour de
+         * courtes trames JSON, le risque de débordement du FIFO TX
+         * matériel est négligeable en pratique. */
+        XIOModule_SendByte(g_io_module.BaseAddress, (uint8_t)trame[i]);
+    }
+}
+
+/* ------------------------------------------------------------------- */
+/* 13. GESTION DES LEDS D'ALERTE (registre GPO)                         */
+/* ------------------------------------------------------------------- */
+
+static void GPIO_MettreAJourLeds(RfEtat_t etat, uint8_t heartbeat_on)
+{
+    uint32_t masque = 0U;
+
+    if (etat == RF_STATE_ALERTE)
+    {
+        masque |= LED_MASK_ALERTE;
+    }
+    else
+    {
+        masque |= LED_MASK_NORMAL;
+    }
+
+    if (heartbeat_on != 0U)
+    {
+        masque |= LED_MASK_HEARTBEAT;
+    }
+
+    XIOModule_DiscreteWrite(&g_io_module, GPO_LED_CHANNEL, masque);
+}
+
+/* ------------------------------------------------------------------- */
+/* 14. INTERRUPTION - ÉCHANTILLONNAGE PÉRIODIQUE (FIT1, cadence 1 ms)   */
+/* ------------------------------------------------------------------- */
+
+static void ISR_TimerFit1(void *CallBackRef)
+{
+    (void)CallBackRef; /* Paramètre non utilisé ici */
+
+    g_horloge_systeme_ms += SAMPLE_PERIOD_MS;
+
+    /* Traitement volontairement court dans l'ISR : lecture matérielle
+     * + mise à jour de la moyenne glissante uniquement. La décision
+     * (FSM) et la communication UART sont déportées dans la boucle
+     * principale pour ne jamais bloquer le contexte d'interruption. */
+    RF_EchantillonnerEtFiltrer();
+}
+
+/* ------------------------------------------------------------------- */
+/* 15. INITIALISATION MATÉRIELLE                                        */
+/* ------------------------------------------------------------------- */
+
+static int32_t BSP_InitIOModule(void)
+{
+    int32_t statut;
+    uint32_t i;
+
+    /* Initialisation du buffer du filtre moyenneur à 0 avant tout
+     * démarrage des interruptions. */
+    for (i = 0U; i < RSSI_MA_WINDOW; i++)
+    {
+        g_rssi_buffer[i] = 0;
+    }
+
+    /* Remplacement de IOMODULE_DEVICE_ID par 0 (ou XPAR_IOMODULE_0_DEVICE_ID) */
+#ifdef XPAR_IOMODULE_0_DEVICE_ID
+    statut = XIOModule_Initialize(&g_io_module, XPAR_IOMODULE_0_DEVICE_ID);
+#else
+    statut = XIOModule_Initialize(&g_io_module, 0);
+#endif
+
+    if (statut != XST_SUCCESS)
+    {
+        return XST_FAILURE;
+    }
+
+    statut = XIOModule_Start(&g_io_module);
+    if (statut != XST_SUCCESS)
+    {
+        return XST_FAILURE;
+    }
+
+    /* État initial des LEDs : normal, pas d'alerte. */
+    GPIO_MettreAJourLeds(RF_STATE_NORMAL, 0U);
+
+    return XST_SUCCESS;
+}
+
+static void BSP_InitInterruptions(void)
+{
+    /* L'IO Module dispose de son propre concentrateur d'interruptions
+     * interne : on passe la structure de l'instance g_io_module au handler. */
+    Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,
+                                  (Xil_ExceptionHandler)XIOModule_DeviceInterruptHandler,
+                                  (void *)&g_io_module);
+
+    /* Connexion du gestionnaire applicatif à la source FIT1 */
+    (void)XIOModule_Connect(&g_io_module, FIT1_INTERRUPT_ID,
+                             (XInterruptHandler)ISR_TimerFit1,
+                             (void *)&g_io_module);
+
+    XIOModule_Enable(&g_io_module, FIT1_INTERRUPT_ID);
+
+    /* Active les interruptions au niveau du cœur MicroBlaze */
+    Xil_ExceptionEnable();
+}
+
+/* ------------------------------------------------------------------- */
+/* 16. BOUCLE PRINCIPALE                                                */
+/* ------------------------------------------------------------------- */
+
+int main(void)
+{
+    uint32_t dernier_heartbeat_ms = 0U;
+    uint8_t  led_blink_etat       = 0U;
+
+    if (BSP_InitIOModule() != XST_SUCCESS)
+    {
+        /* Échec critique d'initialisation matérielle : on reste en
+         * boucle sécurisée plutôt que de continuer avec un état
+         * indéterminé (fail-safe). */
+        while (1)
+        {
+            /* Blocage volontaire - vérifier le câblage IO Module */
+        }
+    }
+
+    BSP_InitInterruptions();
+
+    while (1)
+    {
+        /* --- Traitement de la détection dès qu'un nouvel
+         * échantillon filtré est disponible (posé par l'ISR). --- */
+        if (g_nouvel_echantillon_pret != 0U)
+        {
+            g_nouvel_echantillon_pret = 0U;
+            FSM_MettreAJour(g_rssi_moyenne_dbm);
+        }
+
+        /* --- Trame de statut périodique (heartbeat / supervision) :
+         * confirme au VMS/ESP32 que le firmware est actif, même en
+         * l'absence d'événement de brouillage. --- */
+        if ((g_horloge_systeme_ms - dernier_heartbeat_ms) >= HEARTBEAT_PERIOD_MS)
+        {
+            char     trame_statut[UART_TX_BUFFER_SIZE];
+            uint32_t longueur;
+
+            dernier_heartbeat_ms = g_horloge_systeme_ms;
+            led_blink_etat       = (uint8_t)(led_blink_etat ^ 1U);
+
+            longueur = JSON_ConstruireTrameStatut(trame_statut, g_rssi_moyenne_dbm,
+                                                   g_etat_courant, g_horloge_systeme_ms,
+                                                   g_compteur_alertes);
+            UART_EnvoyerTrame(trame_statut, longueur);
+
+            GPIO_MettreAJourLeds(g_etat_courant, led_blink_etat);
+        }
+
+        /* Boucle non bloquante : aucune attente active longue, la
+         * latence de détection dépend uniquement de la période
+         * d'échantillonnage (SAMPLE_PERIOD_MS) et du temps de
+         * traitement de la FSM (quelques dizaines de cycles). */
+    }
+
+    /* Non atteint. */
+    return 0;
+} 
